@@ -17,24 +17,25 @@
 
 from django.contrib import admin
 
-# Register your models here.
-
-from .models import Message, Room, User
+from .models import Player, Room, Vote
 
 
-# Admin view for Room model
 @admin.register(Room)
 class RoomAdmin(admin.ModelAdmin):
-    list_display = ("roomid", "messagecount", "createdate")
+    list_display = ("roomid", "status", "phase", "created_at")
 
 
-# Admin view for User model
-@admin.register(User)
-class UserAdmin(admin.ModelAdmin):
+@admin.register(Player)
+class PlayerAdmin(admin.ModelAdmin):
     list_display = ("roomid", "userid", "role", "userpsw")
 
+    def roomid(self, obj):
+        return obj.room.roomid
 
-# Register Message model if you need to manage it in the admin as well
-@admin.register(Message)
-class MessageAdmin(admin.ModelAdmin):
-    list_display = ("roomid", "messageid", "messagetitle")  # You can customize fields here
+
+@admin.register(Vote)
+class VoteAdmin(admin.ModelAdmin):
+    list_display = ("roomid", "kind", "round_no", "agree", "disagree")
+
+    def roomid(self, obj):
+        return obj.room.roomid

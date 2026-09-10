@@ -15,100 +15,103 @@
 # You should have received a copy of the GNU General Public License
 # along with God of Avalon Backend.  If not, see <http://www.gnu.org/licenses/>.
 
-from pyexpat import model
-from unittest import result
 from django.db import models
-from django.http import HttpResponse
-from django.utils import timezone
-from datetime import timedelta
 
-# Create your models here.
+# Roles are stored in the database as stable *codes*, never display strings,
+# so the frontend is free to render/label/localize them however it wants.
+ROLE_CODES = (
+    "merlin",
+    "percival",
+    "morgana",
+    "assassin",
+    "loyal_servant",
+    "oberon",
+    "mordred",
+    "minion",
+)
+
+ROLE_CHOICES = [(code, code) for code in ROLE_CODES]
+
+# Board composition for each valid player count (5 to 10).
+# The Nth element is the role dealt to the Nth player; the list shuffles at start_game.
+TEMPLATES = {
+    5: ["merlin", "percival", "morgana", "assassin", "loyal_servant"],
+    6: ["merlin", "percival", "morgana", "assassin", "loyal_servant", "loyal_servant"],
+    7: ["merlin", "percival", "morgana", "assassin", "loyal_servant", "loyal_servant", "oberon"],
+    8: ["merlin", "percival", "morgana", "assassin", "loyal_servant", "loyal_servant", "loyal_servant", "mordred"],
+    9: ["merlin", "percival", "morgana", "assassin", "mordred", "loyal_servant", "loyal_servant", "loyal_servant", "loyal_servant"],
+    10: ["merlin", "percival", "morgana", "assassin", "mordred", "loyal_servant", "loyal_servant", "loyal_servant", "loyal_servant", "minion"],
+}
+
+# Which roles a given role can *see* at reveal time. Mirrors the original game rules.
+VISIBLE_WHAT = {
+    "merlin": {"morgana", "assassin", "minion", "oberon"},
+    "percival": {"merlin", "morgana"},
+    "assassin": {"assassin", "morgana", "mordred", "minion"},
+    "morgana": {"assassin", "morgana", "mordred", "minion"},
+    "mordred": {"assassin", "morgana", "mordred", "minion"},
+    "minion": {"assassin", "morgana", "mordred", "minion"},
+    "loyal_servant": set(),
+    "oberon": set(),
+}
 
 
 class Room(models.Model):
-    roomid = models.CharField(max_length=6)
-    roomstatus = models.CharField(max_length=7)  # waiting / started
-    messagecount = models.IntegerField()
-    roomfurtherstatus = models.CharField(max_length=7)  # normal / build / quest
-    questcount = models.IntegerField()
-    # Team Building Proposal / Quest#n Proposal
-    votetitle = models.CharField(max_length=22)
-    votecontent = models.CharField(max_length=200)
-    teammembercount = models.IntegerField()
-    teammembercountnow = models.IntegerField()
-    teambuilder = models.CharField(max_length=7)
-    createdate = models.DateTimeField(default=timezone.now)
+    class Status(models.TextChoices):
+        WAITING = "waiting"
+        STARTED = "started"
+
+    class Phase(models.TextChoices):
+        NORMAL = "normal"
+        BUILD = "build"
+        QUEST = "quest"
+
+    roomid = models.CharField(max_length=6, unique=True)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.WAITING)
+    phase = models.CharField(max_length=10, choices=Phase.choices, default=Phase.NORMAL)
+    team_builder = models.ForeignKey(
+        "Player", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
-class User(models.Model):
-    roomid = models.CharField(max_length=6)
+class Player(models.Model):
+    room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name="players")
     userid = models.CharField(max_length=7)
     userpsw = models.CharField(max_length=6)
-    role = models.CharField(max_length=23)
-    onvote = models.BooleanField()
-    voted = models.BooleanField()
-    result = models.BooleanField()
+    # avatar asset file name (e.g. "demon-devil-halloween-lucifer-satan.svg").
+    # Stored for durability; the frontend caches avatars in localStorage and
+    # always reads from there for display, per the API contract.
+    avatar = models.CharField(max_length=100, blank=True, default="")
+    role = models.CharField(max_length=20, blank=True, default="", choices=ROLE_CHOICES)
+    # True when this player is a member of the current proposed team / active quest
+    on_vote = models.BooleanField(default=False)
+    voted = models.BooleanField(default=False)
+    # True = approve/success, False = reject/fail (for the most recent ballot)
+    result = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = ("room", "userid")
 
 
-class Message(models.Model):
-    roomid = models.CharField(max_length=6)
-    messageid = models.IntegerField()
-    messagetitle = models.CharField(max_length=25)  # Title
-    messageusers = models.CharField(max_length=200)  # users
-    message1users = models.CharField(max_length=200)  # Agree
-    message2users = models.CharField(max_length=200)  # Disagree
+class Vote(models.Model):
+    class Kind(models.TextChoices):
+        BUILD = "build"
+        QUEST = "quest"
 
-
-def checkRoomExist(Roomid):
-    return Room.objects.filter(roomid=Roomid).exists()
-
-
-def createValidRoom(Roomid):
-    Room.objects.create(
-        roomid=Roomid,
-        roomstatus="waiting",
-        messagecount=0,
-        roomfurtherstatus="normal",
-        questcount=0,
-        votetitle="",
-        votecontent="",
-        teammembercount=0,
-        teammembercountnow=0,
-        teambuilder="",
+    room = models.ForeignKey(Room, on_delete=models.CASCADE, related_name="votes")
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    # build: proposal number; quest: quest number
+    round_no = models.IntegerField()
+    builder = models.ForeignKey(
+        "Player", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
-    return HttpResponse("createdRoom", status=201)
-
-
-def checkUserExist(Roomid, Userid):
-    return User.objects.filter(roomid=Roomid, userid=Userid).exists()
-
-
-def checkUserValid(Roomid, Userid, Userpsw):
-    return User.objects.filter(roomid=Roomid, userid=Userid, userpsw=Userpsw).exists()
-
-
-def createValidUser(Roomid, Userid, Userpsw):
-    User.objects.create(
-        roomid=Roomid,
-        userid=Userid,
-        userpsw=Userpsw,
-        role="not distrubuted",
-        onvote=False,
-        voted=False,
-        result=False,
-    )
-    return HttpResponse("createdUser", status=201)
-
-
-def getRoomUser(Roomid):
-    Users = User.objects.filter(roomid=Roomid)
-    response = {"userCount": len(Users)}
-    useri = 0
-    for user in Users:
-        useri += 1
-        response[f"user{useri}"] = user.userid
-    return response
-
-
-def getRoomStatus(Roomid):
-    return Room.objects.get(roomid=Roomid).roomstatus
+    # ids of the team members (list, so it survives player/team reshuffles)
+    members = models.JSONField(default=list)
+    # build: approvals; quest: successes
+    agree = models.IntegerField(default=0)
+    # build: rejections; quest: failures
+    disagree = models.IntegerField(default=0)
+    # per-player ballot: [{"userid": ..., "choice": true|false}, ...]
+    ballots = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)

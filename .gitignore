@@ -3,7 +3,6 @@
 /static
 /uwsgi_params
 /goa_backend.ini
-/room/migrations/
 
 # Django #
 *.log
@@ -11,6 +10,7 @@
 *.pyc
 __pycache__
 db.sqlite3
+backups/
 media
 
 # Backup files #
