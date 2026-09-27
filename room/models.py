@@ -80,8 +80,7 @@ class Player(models.Model):
     userid = models.CharField(max_length=7)
     userpsw = models.CharField(max_length=6)
     # avatar asset file name (e.g. "demon-devil-halloween-lucifer-satan.svg").
-    # Stored for durability; the frontend caches avatars in localStorage and
-    # always reads from there for display, per the API contract.
+    # The room snapshot is authoritative. Players may change this while waiting.
     avatar = models.CharField(max_length=100, blank=True, default="")
     role = models.CharField(max_length=20, blank=True, default="", choices=ROLE_CHOICES)
     # True when this player is a member of the current proposed team / active quest

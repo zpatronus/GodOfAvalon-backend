@@ -17,10 +17,15 @@
 
 import json
 import random
+import re
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.db.models import F
 from django.http import JsonResponse
 from django.middleware.csrf import get_token
+from django.views.decorators.http import require_POST
+
+from .avatars import AVATARS
 
 from .models import (
     TEMPLATES,
@@ -49,7 +54,8 @@ def fail(message):
 def parse_body(request):
     """Read and decode a JSON request body (tolerant of empty/malformed input)."""
     try:
-        return json.loads(request.body.decode("utf-8"))
+        body = json.loads(request.body.decode("utf-8"))
+        return body if isinstance(body, dict) else {}
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
@@ -82,41 +88,93 @@ def room_status(request, roomid):
     return ok(status=room.status)
 
 
+@require_POST
 def create_room(request):
     body = parse_body(request)
     roomid = body.get("roomid", "")
-    if not roomid:
+    if not isinstance(roomid, str) or not roomid:
         return fail("roomid_empty")
     if len(roomid) > 6:
         return fail("roomid_long")
-    if get_room(roomid):
+    if not re.fullmatch(r"[A-Za-z0-9]{1,6}", roomid):
+        return fail("bad_roomid")
+    try:
+        with transaction.atomic():
+            Room.objects.create(roomid=roomid)
+    except IntegrityError:
         return fail("roomid_taken")
-    Room.objects.create(roomid=roomid)
     return ok()
 
 
-def join_room(request):
-    body = parse_body(request)
+def lock_room(roomid, create=False):
+    # A write first serializes join/start/avatar changes on SQLite. The row lock
+    # also covers databases supporting SELECT FOR UPDATE.
+    Room.objects.filter(roomid=roomid).update(status=F("status"))
+    if create:
+        Room.objects.get_or_create(roomid=roomid)
+    return Room.objects.select_for_update().filter(roomid=roomid).first()
+
+
+def enter_room(body, create=False):
     roomid, userid, userpsw = body.get("roomid"), body.get("userid"), body.get("userpsw")
-    room = get_room(roomid)
-    if not room:
-        return fail("room_not_found")
-    if len(userid or "") > 7 or len(userpsw or "") > 6:
-        return fail("id_or_psw_long")
-
+    for value, pattern, error in (
+        (roomid, r"[A-Za-z0-9]{1,6}", "bad_roomid"),
+        (userid, r"[A-Za-z0-9_]{1,7}", "bad_userid"),
+        (userpsw, r"[A-Za-z0-9]{1,6}", "bad_password"),
+    ):
+        if not isinstance(value, str) or not re.fullmatch(pattern, value):
+            return fail(error)
     avatar = body.get("avatar", "")
+    if not isinstance(avatar, str) or avatar not in AVATARS:
+        avatar = AVATARS[0]
 
-    existing = room.players.filter(userid=userid).first()
-    if existing:
-        if existing.userpsw == userpsw:
-            # A player's first avatar is permanent. Return the stored filename so
-            # a re-login can restore the correct localStorage value.
-            return ok(created=False, avatar=existing.avatar)
-        return fail("wrong_password")
-    if room.status != Room.Status.WAITING:
-        return fail("room_started")
-    player = room.players.create(userid=userid, userpsw=userpsw, avatar=avatar)
-    return ok(created=True, avatar=player.avatar)
+    with transaction.atomic():
+        room = lock_room(roomid, create=create)
+        if not room:
+            return fail("room_not_found")
+        existing = room.players.filter(userid=userid).first()
+        if existing:
+            if existing.userpsw != userpsw:
+                return fail("wrong_password")
+            return ok(created=False, avatar=existing.avatar, roomstatus=room.status)
+        if room.status != Room.Status.WAITING:
+            return fail("room_started")
+        if room.players.count() >= max(TEMPLATES):
+            return fail("room_full")
+        player = room.players.create(userid=userid, userpsw=userpsw, avatar=avatar)
+        return ok(created=True, avatar=player.avatar, roomstatus=room.status)
+
+
+@require_POST
+def create_or_join_room(request):
+    # The room and its first player commit together. All players requesting the
+    # same next ID join this room, including simultaneous first arrivals.
+    return enter_room(parse_body(request), create=True)
+
+
+@require_POST
+def join_room(request):
+    return enter_room(parse_body(request))
+
+
+@require_POST
+def set_avatar(request):
+    body = parse_body(request)
+    avatar = body.get("avatar")
+    if not isinstance(avatar, str) or avatar not in AVATARS:
+        return fail("bad_avatar")
+    player = load_player(body)
+    if not player:
+        return fail("bad_credentials")
+    with transaction.atomic():
+        room = lock_room(player.room.roomid)
+        if not room:
+            return fail("room_not_found")
+        if room.status != Room.Status.WAITING:
+            return fail("not_waiting")
+        player.avatar = avatar
+        player.save(update_fields=["avatar"])
+        return ok(avatar=avatar, avatars=dict(room.players.values_list("userid", "avatar")))
 
 
 def waiting_room(request):
@@ -130,25 +188,29 @@ def waiting_room(request):
     return ok(roomstatus=room.status, users=users, avatars=avatars)
 
 
+@require_POST
 def start_game(request):
     body = parse_body(request)
     player = load_player(body)
     if not player:
         return fail("bad_credentials")
-    room = player.room
-    if room.status == Room.Status.STARTED:
-        return fail("already_started")
-    count = room.players.count()
-    roles = TEMPLATES.get(count)
-    if roles is None:
-        return fail("bad_players_count")
-    deck = list(roles)
-    random.shuffle(deck)
-    for other in room.players.order_by("id"):
-        other.role = deck.pop()
-        other.save()
-    room.status = Room.Status.STARTED
-    room.save()
+    with transaction.atomic():
+        room = lock_room(player.room.roomid)
+        if not room:
+            return fail("room_not_found")
+        if room.status == Room.Status.STARTED:
+            return fail("already_started")
+        players = list(room.players.order_by("id"))
+        roles = TEMPLATES.get(len(players))
+        if roles is None:
+            return fail("bad_players_count")
+        deck = list(roles)
+        random.shuffle(deck)
+        for other in players:
+            other.role = deck.pop()
+        Player.objects.bulk_update(players, ["role"])
+        room.status = Room.Status.STARTED
+        room.save(update_fields=["status"])
     return ok()
 
 
